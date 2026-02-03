@@ -1,8 +1,9 @@
 import nodemailer from "nodemailer";
+import { google } from "googleapis";
 
 /**
  * Appwrite Function (Node.js)
- * Sends SBA booking requests to silvaboxingacademy@gmail.com via SMTP.
+ * Sends SBA booking requests to silvaboxingacademy@gmail.com using Gmail OAuth2 (NO app password).
  *
  * Expected request body format (recommended):
  * {
@@ -19,7 +20,15 @@ import nodemailer from "nodemailer";
  *     "message": "..."
  *   }
  * }
+ *
+ * Required ENV (Appwrite Function variables):
+ * - GOOGLE_CLIENT_ID
+ * - GOOGLE_CLIENT_SECRET
+ * - GOOGLE_REFRESH_TOKEN
+ * - GMAIL_SENDER                (e.g. silvaboxingacademy@gmail.com)
+ * - SBA_ADMIN_EMAIL             (optional; defaults to silvaboxingacademy@gmail.com)
  */
+
 export default async ({ req, res, log, error }) => {
   try {
     // ---- Robust body parsing (Appwrite can pass object or string depending on config) ----
@@ -29,13 +38,13 @@ export default async ({ req, res, log, error }) => {
       try {
         body = JSON.parse(body);
       } catch {
-        // If body is a string but not JSON, treat as empty
         body = {};
       }
     }
 
     // Support either { payload: {...} } or direct {...}
-    const payload = body?.payload && typeof body.payload === "object" ? body.payload : (body || {});
+    const payload =
+      body?.payload && typeof body.payload === "object" ? body.payload : body || {};
 
     // ---- SBA form fields ----
     const fullName = payload.fullName || payload.name || "Unknown";
@@ -47,9 +56,9 @@ export default async ({ req, res, log, error }) => {
 
     // Booking selections
     const cycle = payload.cycle || "Unknown";
-    const cycleLabel = payload.cycleLabel || cycle; // allow UI label
+    const cycleLabel = payload.cycleLabel || cycle;
     const pkg = payload.package || "Unknown";
-    const packageLabel = payload.packageLabel || pkg; // allow UI label
+    const packageLabel = payload.packageLabel || pkg;
 
     // ---- Basic validation (fail fast) ----
     const missing = [];
@@ -69,23 +78,63 @@ export default async ({ req, res, log, error }) => {
       );
     }
 
-    // ---- SMTP config (env vars set in Appwrite Function settings) ----
+    // ---- ENV ----
+    const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+    const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+    const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
+
+    const GMAIL_SENDER =
+      process.env.GMAIL_SENDER || "silvaboxingacademy@gmail.com";
+    const TO_EMAIL =
+      process.env.SBA_ADMIN_EMAIL || "silvaboxingacademy@gmail.com";
+
+    if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) {
+      return res.json(
+        {
+          ok: false,
+          error:
+            "Missing Gmail OAuth env vars. Required: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN"
+        },
+        500
+      );
+    }
+
+    // ---- OAuth2: mint access token server-side (unattended) ----
+    const oAuth2Client = new google.auth.OAuth2(
+      GOOGLE_CLIENT_ID,
+      GOOGLE_CLIENT_SECRET
+    );
+    oAuth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
+
+    let accessToken = "";
+    try {
+      const tokenResponse = await oAuth2Client.getAccessToken();
+      accessToken = tokenResponse?.token || "";
+      if (!accessToken) throw new Error("Empty access token returned.");
+    } catch (e) {
+      error("❌ Failed to mint Gmail access token:", e?.message || String(e));
+      return res.json(
+        { ok: false, error: "Failed to mint Gmail access token." },
+        500
+      );
+    }
+
+    // ---- Nodemailer with OAuth2 (Gmail) ----
     const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: parseInt(process.env.SMTP_PORT || "587", 10),
-      secure: process.env.SMTP_SECURE === "true", // true for 465, false for 587
+      service: "gmail",
       auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
+        type: "OAuth2",
+        user: GMAIL_SENDER,
+        clientId: GOOGLE_CLIENT_ID,
+        clientSecret: GOOGLE_CLIENT_SECRET,
+        refreshToken: GOOGLE_REFRESH_TOKEN,
+        accessToken
       }
     });
-
-    const TO_EMAIL = process.env.SBA_ADMIN_EMAIL || "silvaboxingacademy@gmail.com";
 
     // ---- SBA branded email template (email-safe HTML) ----
     const now = new Date().toLocaleString("en-GB", { timeZone: "Europe/Berlin" });
 
-    // Simple inline “SBA” logo block (email-safe)
     const logoBlock = `
       <div style="display:flex;align-items:center;gap:14px;">
         <div style="width:44px;height:44px;background:#b91c1c;border-radius:999px;display:flex;align-items:center;justify-content:center;">
@@ -186,12 +235,14 @@ export default async ({ req, res, log, error }) => {
               </table>
             </div>
 
-            ${(goals || message) ? `
+            ${(goals || message)
+              ? `
               <div style="border:1px solid #222;background:#0b0b0b;border-radius:10px;padding:16px;margin-bottom:16px;">
                 <div style="color:#b91c1c;font-family:Arial,Helvetica,sans-serif;font-weight:800;text-transform:uppercase;letter-spacing:2px;font-size:11px;margin-bottom:10px;">
                   Notes
                 </div>
-                ${goals ? `
+                ${goals
+                  ? `
                   <div style="margin-bottom:10px;">
                     <div style="color:#9ca3af;font-family:Arial,Helvetica,sans-serif;font-size:12px;text-transform:uppercase;letter-spacing:2px;margin-bottom:6px;">
                       Primary Goals
@@ -200,8 +251,10 @@ export default async ({ req, res, log, error }) => {
                       ${escapeHtml(goals)}
                     </div>
                   </div>
-                ` : ''}
-                ${message ? `
+                `
+                  : ""}
+                ${message
+                  ? `
                   <div>
                     <div style="color:#9ca3af;font-family:Arial,Helvetica,sans-serif;font-size:12px;text-transform:uppercase;letter-spacing:2px;margin-bottom:6px;">
                       Message
@@ -210,9 +263,11 @@ export default async ({ req, res, log, error }) => {
                       ${escapeHtml(message)}
                     </div>
                   </div>
-                ` : ''}
+                `
+                  : ""}
               </div>
-            ` : ''}
+            `
+              : ""}
 
             <div style="padding-top:10px;border-top:1px solid #222;color:#6b7280;font-family:Arial,Helvetica,sans-serif;font-size:11px;line-height:1.6;">
               Received: ${escapeHtml(now)} (Europe/Berlin)<br/>
@@ -226,7 +281,7 @@ export default async ({ req, res, log, error }) => {
     const subject = `SBA Booking Request — ${fullName} — ${cycleLabel}`;
 
     const mailOptions = {
-      from: `"SBA Website" <${process.env.SMTP_USER}>`,
+      from: `"SBA Website" <${GMAIL_SENDER}>`,
       to: TO_EMAIL,
       replyTo: userEmail !== "Unknown" ? userEmail : undefined,
       subject,
@@ -235,7 +290,7 @@ export default async ({ req, res, log, error }) => {
 
     await transporter.sendMail(mailOptions);
 
-    log("✅ SBA booking email sent.");
+    log("✅ SBA booking email sent (Gmail OAuth2).");
     return res.json({ ok: true });
   } catch (err) {
     error("❌ SBA email sending failed:", err?.message || String(err));
@@ -244,7 +299,7 @@ export default async ({ req, res, log, error }) => {
 };
 
 // --- Small helper to prevent HTML injection in email ---
-function escapeHtml(input) {
+function escapeHtml(input: any) {
   return String(input ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
